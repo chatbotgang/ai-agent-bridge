@@ -51,6 +51,73 @@ AGENT_BRIDGE_SLACK_APP_TOKEN=xapp-your-app-level-token
 
 Both are **required**. The adapter raises `ValueError` at startup if either is missing.
 
+### Optional: Startup Notification
+
+Send a Slack message after Socket Mode connects successfully:
+
+```bash
+AGENT_BRIDGE_SLACK_STARTUP_NOTIFY_CHANNEL=C12345678
+AGENT_BRIDGE_SLACK_STARTUP_NOTIFY_MESSAGE=Bot is online :white_check_mark:
+```
+
+Both must be set for the notification to fire. Useful for deploy pipelines that need confirmation the bot is actually alive and connected.
+
+### Optional: Channel Allow-List
+
+Restrict which channels can reach the agent:
+
+```bash
+AGENT_BRIDGE_SLACK_ALLOW_CHANNELS=ops-alerts,team-eng,incidents
+```
+
+- Comma-separated **channel names** (the `#name`, not the `C0123...` ID). Leading `#`, surrounding whitespace, and case are normalized away, so `#Ops-Alerts` and `ops-alerts` match the same channel.
+- **Empty / unset = allow every channel** (backward compatible).
+- When non-empty, only messages from listed channels reach the agent. Anything else gets a reply in-thread (see `AGENT_BRIDGE_SLACK_CHANNEL_NOT_ALLOWED_MESSAGE` below) and is then dropped before any agent work.
+- `AGENT_BRIDGE_SLACK_CHANNEL_NOT_ALLOWED_MESSAGE` overrides that reply text; it defaults to a fixed English notice.
+- **DMs are also gated.** A DM has no channel name (it falls back to the channel ID), so it never matches a name in the list — meaning a non-empty allow-list blocks all DMs. Leave the list empty if you want DMs to keep working.
+
+The gate runs first in `_process_message`, resolving the channel name via the cached `conversations:info` lookup, so it costs at most one API call per distinct channel.
+
+### Optional: Usage / Cost Report
+
+Append a usage/cost footer below the final agent reply:
+
+```bash
+AGENT_BRIDGE_SLACK_USAGE_REPORT_ENABLED=true
+```
+
+- **Unset / false = no footer** (default).
+- The data comes from `Completion.usage` (this turn) and `Completion.session_usage` (the session's running total), which the bridge assembles from the agent's reported usage. See [bridge.md](../bridge.md#usage-reporting) for the generic `Usage` structure and how the session total is accumulated.
+- **The session line only appears when the bridge has tracked the session from its first turn.** After a process restart (the accumulator is in-memory) or for a pre-existing session, `session_usage` is `None` and only the current-turn line is shown — never a misleadingly-low total.
+
+The footer is rendered as an italic Slack footnote beneath a labelled divider (a custom template is wrapped the same way). Default layout:
+
+```
+─────cost─────
+_💰 $0.0123 · 🔢 1234 in / 456 out · 📦 3400 cached · ⏱️ 12.3s_
+_📈 session: $0.0456 · 18700 tokens · 3 turns_
+```
+
+#### Custom template
+
+Override the format with a `{placeholder}` template:
+
+```bash
+AGENT_BRIDGE_SLACK_USAGE_REPORT_TEMPLATE=💵 {cost_usd} | {total_tokens} tokens | {duration_s}s
+```
+
+Unknown placeholders render blank and a malformed template degrades to its raw text (it never breaks the reply). Available placeholders — each also has a `session_`-prefixed variant for the running total (e.g. `{session_cost_usd}`); session placeholders render `0` when the session total isn't tracked:
+
+| Placeholder | Meaning |
+|-------------|---------|
+| `{cost_usd}` | Cost in USD, 4 decimals |
+| `{input_tokens}` / `{output_tokens}` | Token counts (exclude cache) |
+| `{cache_read_tokens}` / `{cache_creation_tokens}` | Cache token counts |
+| `{total_tokens}` | Real total: input + output + cache read + cache creation |
+| `{num_turns}` | Agent turns |
+| `{duration_ms}` / `{duration_s}` | Wall-clock duration |
+| `{duration_api_ms}` | API-only duration |
+
 ## Session Semantics
 
 **One Slack thread = one agent session.**
@@ -169,7 +236,9 @@ Updates the message with the final response text. Error cases:
 | Capacity full (new request) | `:no_entry: Too many requests being processed, please try again later.` |
 | Capacity full (pending drained) | `:x: Your queued message could not be processed — please try again shortly.` |
 | No response | `_No response from agent._` |
-| Response too long | First 300 chars + note, full content uploaded as `response.md` file snippet |
+| Response too long (> ~3900 UTF-8 bytes) | Preview (up to 1000 bytes) + note, full content uploaded as `response.md` file snippet; if upload fails, user sees `(response too long; upload failed — please retry)` |
+
+On a successful (non-error) completion, a usage/cost footer is appended when `AGENT_BRIDGE_SLACK_USAGE_REPORT_ENABLED=true` (see [Usage / Cost Report](#optional-usage--cost-report)).
 
 ## File Attachments
 
@@ -193,21 +262,28 @@ The agent can then decide whether to fetch and process the files.
 
 ## Context Resolution
 
-The adapter resolves display names for Slack entities and passes them as context to the agent:
+The adapter resolves display names for Slack entities and uses them to build the prompt prefix and the agent's system prompt:
 
 | Field | Source | Purpose |
 |-------|--------|---------|
-| `platform` | Hardcoded `"slack"` | Agent knows which platform |
 | `workspace` | `team_info()` API | Workspace name |
 | `channel_id` | Event payload | Channel identifier |
 | `channel_name` | `conversations_info()` API | Human-readable channel name |
 | `thread_ts` | Event payload | Thread root timestamp |
 | `user_id` | Event payload | Slack user ID |
 | `user_name` | `users_info()` API | Display name or real name |
+| `bot_user_id` | `auth.test()` API at startup | The bot's own Slack user ID — surfaced as `Your Slack mention: <@U…>` so the agent can detect when users @-mention it |
 
-All resolutions are cached by `SlackInfoCache` to avoid repeated API calls.
+All resolutions are cached by `SlackInfoCache` to avoid repeated API calls. The bot user ID is fetched once during `start()` and reused for every request. The bot's display name is intentionally not surfaced — the Slack app's name and the AI agent's persona are independent concerns.
 
-This context is passed to the agent as a system prompt appendix, so the agent knows who is speaking and from where.
+### Prompt prefix and system prompt
+
+The adapter (not the agent) owns chat-platform framing. Two static helpers shape what's sent to the bridge:
+
+- `_tag_prompt(text, context)` — prefixes the user's message with `[user_name (user_id)]:` so the agent knows who is speaking. The tagged string is passed as `text` to `bridge.handle_message`.
+- `_build_system_prompt(context)` — produces the Slack system prompt (workspace/channel/thread metadata, the bot's mention syntax, and the convention that every message is sender-tagged) and passes it as `system_prompt`.
+
+This split keeps the agent platform-agnostic: a future platform that sends raw data (heartbeat, webhooks, queues, etc.) can produce its own prefix + system prompt without changing the agent.
 
 ## Stale Session Cleanup
 

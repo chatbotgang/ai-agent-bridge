@@ -22,9 +22,10 @@ from agent_bridge.events import (
     Processing,
     StatusUpdate,
     TextDelta,
+    Usage,
     UserQuestion,
 )
-from agent_bridge.platforms.slack.config import SlackConfig
+from agent_bridge.platforms.slack.config import SlackConfig, _normalize_channel
 from agent_bridge.session import SessionManager
 
 logger = logging.getLogger(__name__)
@@ -32,10 +33,102 @@ logger = logging.getLogger(__name__)
 # Minimum interval between Slack message updates (seconds)
 UPDATE_THROTTLE_SECONDS = 1.5
 
-# Slack chat_update/chat_postMessage text limit.
-# The documented limit is ~40 000 chars, but mrkdwn formatting can lower
-# the effective ceiling significantly. Use a conservative threshold.
-SLACK_MSG_MAX_LENGTH = 3_900
+# Slack chat_update/chat_postMessage effective ceiling. Empirically ~4000
+# UTF-8 bytes (not characters) — a CJK char is 3 bytes, so a char-based
+# check lets long CJK messages slip past and hit msg_too_long.
+SLACK_MSG_MAX_BYTES = 3_900
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _truncate_to_bytes(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    data = text.encode("utf-8")
+    if len(data) <= max_bytes:
+        return text
+    # errors="ignore" drops any trailing partial multi-byte sequence
+    return data[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _fit_with_suffix(text: str, max_bytes: int, suffix: str) -> str:
+    if _utf8_len(text) <= max_bytes:
+        return text
+    budget = max(0, max_bytes - _utf8_len(suffix))
+    return _truncate_to_bytes(text, budget) + suffix
+
+
+class _SafeDict(dict):
+    """Leaves unknown {placeholders} blank instead of raising KeyError."""
+
+    def __missing__(self, key: str) -> str:
+        return ""
+
+
+def _usage_fields(usage: Usage, prefix: str = "") -> dict[str, object]:
+    return {
+        f"{prefix}cost_usd": f"{usage.cost_usd:.4f}",
+        f"{prefix}input_tokens": usage.input_tokens,
+        f"{prefix}output_tokens": usage.output_tokens,
+        f"{prefix}cache_read_tokens": usage.cache_read_tokens,
+        f"{prefix}cache_creation_tokens": usage.cache_creation_tokens,
+        f"{prefix}total_tokens": usage.total_tokens,
+        f"{prefix}num_turns": usage.num_turns,
+        f"{prefix}duration_ms": usage.duration_ms,
+        f"{prefix}duration_s": f"{usage.duration_ms / 1000:.1f}",
+        f"{prefix}duration_api_ms": usage.duration_api_ms,
+    }
+
+
+def _render_usage_template(
+    template: str, turn: Usage, session: Usage | None
+) -> str:
+    """Substitute {placeholders} in a user-supplied template. Session fields
+    fall back to zeros when the session total isn't tracked. Malformed
+    templates degrade to the raw string rather than crashing the reply.
+    """
+    values = _usage_fields(turn)
+    values.update(_usage_fields(session or Usage(), "session_"))
+    try:
+        return template.format_map(_SafeDict(values))
+    except (ValueError, IndexError):
+        logger.warning("Invalid AGENT_BRIDGE_SLACK_USAGE_REPORT_TEMPLATE: %r", template)
+        return template
+
+
+def _default_usage_footer(turn: Usage, session: Usage | None) -> str:
+    lines = [
+        f"💰 ${turn.cost_usd:.4f} · "
+        f"🔢 {turn.input_tokens} in / {turn.output_tokens} out · "
+        f"📦 {turn.cache_read_tokens} cached · "
+        f"⏱️ {turn.duration_ms / 1000:.1f}s"
+    ]
+    # Option B: only show the session line when we have a trustworthy total.
+    if session is not None:
+        lines.append(
+            f"📈 session: ${session.cost_usd:.4f} · "
+            f"{session.total_tokens} tokens · "
+            f"{session.num_turns} turns"
+        )
+    return "\n".join(lines)
+
+
+# Slack message text has no real horizontal rule, so fake a labelled one with
+# box-drawing chars — the "cost" label centred in the rule marks everything
+# below it as usage/cost info.
+_USAGE_DIVIDER = "─────cost─────"
+
+
+def _as_footnote(body: str) -> str:
+    """Render text as an italic footnote beneath a labelled divider. Applied to
+    both the default layout and a custom template so the footer reads as a note.
+    """
+    lines = [_USAGE_DIVIDER]
+    for line in body.split("\n"):
+        lines.append(f"_{line}_" if line.strip() else "")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -67,15 +160,11 @@ class SlackInfoCache:
         self.channels: dict[str, str] = {}
         self.users: dict[str, str] = {}
 
-    async def resolve(self, channel: str, user_id: str, client) -> tuple[str, str, str]:
-        """Return (workspace_name, channel_name, user_name), fetching only on cache miss."""
-        if self.workspace is None:
-            try:
-                team_info = await client.team_info()
-                self.workspace = team_info["team"].get("name", "")
-            except SlackApiError as e:
-                logger.warning("Failed to resolve workspace name: %s", e.response["error"])
+    async def resolve_channel(self, channel: str, client) -> str:
+        """Return the channel name, fetching only on cache miss.
 
+        DMs/group-DMs have no name; falls back to the channel id.
+        """
         if channel not in self.channels:
             try:
                 conv_info = await client.conversations_info(channel=channel)
@@ -87,6 +176,18 @@ class SlackInfoCache:
                     e.response["error"],
                 )
                 self.channels[channel] = channel
+        return self.channels[channel]
+
+    async def resolve(self, channel: str, user_id: str, client) -> tuple[str, str, str]:
+        """Return (workspace_name, channel_name, user_name), fetching only on cache miss."""
+        if self.workspace is None:
+            try:
+                team_info = await client.team_info()
+                self.workspace = team_info["team"].get("name", "")
+            except SlackApiError as e:
+                logger.warning("Failed to resolve workspace name: %s", e.response["error"])
+
+        channel_name = await self.resolve_channel(channel, client)
 
         if user_id not in self.users:
             try:
@@ -103,7 +204,7 @@ class SlackInfoCache:
                 )
                 self.users[user_id] = user_id
 
-        return (self.workspace or "", self.channels[channel], self.users[user_id])
+        return (self.workspace or "", channel_name, self.users[user_id])
 
 
 class SlackAdapter:
@@ -120,6 +221,7 @@ class SlackAdapter:
         self._handler: AsyncSocketModeHandler | None = None
         self._sessions: dict[str, _SessionState] = {}
         self._name_cache = SlackInfoCache()
+        self._bot_user_id: str | None = None
         self._register_handlers()
 
     # --- Session key: Slack defines thread = session ---
@@ -166,6 +268,49 @@ class SlackAdapter:
                 return
             await self._process_message(event, say, client)
 
+        @self._app.action(re.compile(r".*"))
+        async def handle_block_action(ack, body, say, client) -> None:
+            # Acknowledge immediately to prevent Slack's 3-second timeout error.
+            await ack()
+            # Route the button's value back into the session so the agent can
+            # continue the conversation (e.g. respond to an AskUserQuestion).
+            container = body.get("container", {})
+            channel = container.get("channel_id", "")
+            thread_ts = container.get("thread_ts") or container.get("message_ts", "")
+            user_id = body.get("user", {}).get("id", "")
+            if not channel or not thread_ts or not user_id:
+                return
+            actions = body.get("actions", [])
+            if not actions:
+                return
+            action = actions[0]
+            text = (
+                action.get("value")
+                or action.get("text", {}).get("text", "")
+                or action.get("selected_option", {}).get("text", {}).get("text", "")
+            )
+            if not text:
+                return
+            event = {
+                "channel": channel,
+                "user": user_id,
+                "text": text,
+                "thread_ts": thread_ts,
+                "ts": thread_ts,
+            }
+            await self._process_message(event, say, client)
+
+    async def _channel_allowed(self, channel: str, client) -> bool:
+        """Gate by the configured channel allow-list.
+
+        Empty allow-list = allow everything. Otherwise only channels whose
+        resolved name matches reach the agent; DMs (no name) never match.
+        """
+        if not self._config.allow_channels:
+            return True
+        channel_name = await self._name_cache.resolve_channel(channel, client)
+        return _normalize_channel(channel_name) in self._config.allow_channels
+
     async def _resolve_context(
         self, channel: str, user_id: str, thread_ts: str, client
     ) -> dict[str, str]:
@@ -173,8 +318,7 @@ class SlackAdapter:
         workspace, channel_name, user_name = await self._name_cache.resolve(
             channel, user_id, client
         )
-        return {
-            "platform": "slack",
+        ctx = {
             "workspace": workspace,
             "channel_id": channel,
             "channel_name": channel_name,
@@ -182,12 +326,56 @@ class SlackAdapter:
             "user_id": user_id,
             "user_name": user_name,
         }
+        if self._bot_user_id:
+            ctx["bot_user_id"] = self._bot_user_id
+        return ctx
+
+    @staticmethod
+    def _tag_prompt(text: str, context: dict[str, str]) -> str:
+        # Slack-flavored sender identity prefix. The agent stays platform-agnostic;
+        # the platform owns how it names speakers.
+        user_name = context.get("user_name", "unknown")
+        user_id = context.get("user_id", "")
+        tag = f"{user_name} ({user_id})" if user_id else user_name
+        return f"[{tag}]: {text}"
+
+    @staticmethod
+    def _build_system_prompt(context: dict[str, str]) -> str:
+        parts: list[str] = []
+        if context.get("workspace"):
+            parts.append(f"Workspace: {context['workspace']}")
+        channel_name = context.get("channel_name", "")
+        channel_id = context.get("channel_id", "")
+        if channel_name and channel_id:
+            parts.append(f"Channel: #{channel_name} ({channel_id})")
+        elif channel_id:
+            parts.append(f"Channel: {channel_id}")
+        if context.get("thread_ts"):
+            parts.append(f"Thread: {context['thread_ts']}")
+        bot_user_id = context.get("bot_user_id", "")
+        if bot_user_id:
+            parts.append(f"Your Slack mention: <@{bot_user_id}>")
+
+        return (
+            "This conversation is from Slack. "
+            "Each message is prefixed with [user_name (user_id)] to identify the speaker.\n"
+            + "\n".join(parts)
+        )
 
     async def _process_message(self, event: dict, say, client) -> None:
         channel = event.get("channel", "")
         user_id = event.get("user", "")
         text = event.get("text", "")
         thread_ts = event.get("thread_ts") or event.get("ts", "")
+
+        # Gate 0: channel allow-list. Reply with a fixed notice, then stop.
+        if not await self._channel_allowed(channel, client):
+            logger.info("Rejecting message from non-allowed channel %s", channel)
+            await say(
+                text=self._config.channel_not_allowed_message,
+                thread_ts=thread_ts,
+            )
+            return
 
         # Strip bot mention from text (e.g., "<@U12345> do something" → "do something")
         text = re.sub(r"<@[A-Z0-9]+>\s*", "", text).strip()
@@ -329,8 +517,9 @@ class SlackAdapter:
 
         async for event_obj in self._bridge.handle_message(
             session_key=session_key,
-            text=text,
+            text=self._tag_prompt(text, context),
             context=context,
+            system_prompt=self._build_system_prompt(context),
         ):
             match event_obj:
                 case Processing():
@@ -349,6 +538,8 @@ class SlackAdapter:
                         )
 
                 case TextDelta(text=chunk):
+                    if accumulated_text:
+                        accumulated_text += "\n\n"
                     accumulated_text += chunk
                     now = time.monotonic()
                     if now - last_update_time >= UPDATE_THROTTLE_SECONDS and message_ts:
@@ -385,7 +576,12 @@ class SlackAdapter:
                     )
                     pending_user_questions = questions
 
-                case Completion(text=final_text, is_error=is_error):
+                case Completion(
+                    text=final_text,
+                    is_error=is_error,
+                    usage=usage,
+                    session_usage=session_usage,
+                ):
                     completed = True
                     if pending_user_questions:
                         logger.debug(
@@ -413,7 +609,7 @@ class SlackAdapter:
                     if last_update_time and elapsed < UPDATE_THROTTLE_SECONDS:
                         await asyncio.sleep(UPDATE_THROTTLE_SECONDS - elapsed)
 
-                    final = final_text or accumulated_text
+                    final = accumulated_text or final_text
                     if is_error:
                         if existing_message_ts is not None:
                             # Pending message rejected by Bridge
@@ -428,15 +624,39 @@ class SlackAdapter:
                             )
                     if not final:
                         final = "_No response from agent._"
-                    if len(final) > SLACK_MSG_MAX_LENGTH:
+                    # The usage footer is metadata about the reply, not part of
+                    # it. Keep it out of both the upload-size decision and the
+                    # uploaded file, and always render it inline (it's tiny) so
+                    # it survives even when the body is truncated to a snippet.
+                    footer = (
+                        ""
+                        if is_error
+                        else self._build_usage_footer(usage, session_usage)
+                    )
+                    if _utf8_len(final) > SLACK_MSG_MAX_BYTES:
+                        uploaded = await self._upload_snippet(
+                            channel, thread_ts, final
+                        )
+                        notice = (
+                            "\n\n_… Full response uploaded as file below._"
+                            if uploaded
+                            else "\n\n_… (response too long; upload failed — please retry)_"
+                        )
+                        preview_budget = min(
+                            1000,
+                            SLACK_MSG_MAX_BYTES - _utf8_len(notice) - _utf8_len(footer),
+                        )
+                        short = (
+                            _truncate_to_bytes(final, preview_budget) + notice + footer
+                        )
                         if message_ts:
-                            short = final[:300] + "\n\n_… Full response uploaded as file below._"
                             await self._update_message(channel, message_ts, short)
-                        await self._upload_snippet(channel, thread_ts, final)
+                        elif say is not None:
+                            await say(text=short, thread_ts=thread_ts)
                     elif message_ts:
-                        await self._update_message(channel, message_ts, final)
+                        await self._update_message(channel, message_ts, final + footer)
                     elif say is not None:
-                        await say(text=final, thread_ts=thread_ts)
+                        await say(text=final + footer, thread_ts=thread_ts)
 
         # Safety net: if stream ended without Completion, strip residual tool_status
         if not completed and message_ts and accumulated_text:
@@ -444,14 +664,40 @@ class SlackAdapter:
                 "Session %s: stream ended without Completion — cleaning up message",
                 session_key,
             )
-            if len(accumulated_text) > SLACK_MSG_MAX_LENGTH:
-                short = accumulated_text[:300] + "\n\n_… Full response uploaded as file below._"
+            if _utf8_len(accumulated_text) > SLACK_MSG_MAX_BYTES:
+                uploaded = await self._upload_snippet(
+                    channel, thread_ts, accumulated_text
+                )
+                notice = (
+                    "\n\n_… Full response uploaded as file below._"
+                    if uploaded
+                    else "\n\n_… (response too long; upload failed — please retry)_"
+                )
+                preview_budget = min(
+                    1000, SLACK_MSG_MAX_BYTES - _utf8_len(notice)
+                )
+                short = _truncate_to_bytes(accumulated_text, preview_budget) + notice
                 await self._update_message(channel, message_ts, short)
-                await self._upload_snippet(channel, thread_ts, accumulated_text)
             else:
                 await self._update_message(channel, message_ts, accumulated_text)
 
         return None
+
+    def _build_usage_footer(
+        self, usage: Usage | None, session_usage: Usage | None
+    ) -> str:
+        """Compose the usage footer (with a leading blank line), or '' when the
+        feature is off or no usage was reported. Template wins over the default.
+        """
+        if not self._config.usage_report_enabled or usage is None:
+            return ""
+        if self._config.usage_report_template:
+            body = _render_usage_template(
+                self._config.usage_report_template, usage, session_usage
+            )
+        else:
+            body = _default_usage_footer(usage, session_usage)
+        return f"\n\n{_as_footnote(body)}" if body else ""
 
     @staticmethod
     def _format_questions_for_slack(questions: list[dict]) -> str:
@@ -492,31 +738,56 @@ class SlackAdapter:
             )
 
     async def _update_message(self, channel: str, ts: str, text: str) -> None:
-        if len(text) > SLACK_MSG_MAX_LENGTH:
-            text = text[:SLACK_MSG_MAX_LENGTH] + "\n\n_… (generating response…)_"
+        text = _fit_with_suffix(
+            text, SLACK_MSG_MAX_BYTES, "\n\n_… (generating response…)_"
+        )
         try:
             await self._app.client.chat_update(
                 channel=channel,
                 ts=ts,
                 text=text,
             )
+            return
         except SlackApiError as e:
-            if e.response["error"] == "msg_too_long":
-                try:
-                    short = text[:500] + "\n\n_… (generating response…)_"
-                    await self._app.client.chat_update(
-                        channel=channel, ts=ts, text=short,
-                    )
-                except SlackApiError:
-                    pass
-            else:
+            if e.response["error"] != "msg_too_long":
                 logger.warning(
-                    "Failed to update Slack message %s: %s", ts, e.response["error"]
+                    "Failed to update Slack message %s: %s",
+                    ts,
+                    e.response["error"],
                 )
+                return
+
+        # Slack still rejected the byte-trimmed payload. Fall back progressively
+        # rather than the old hard 500-char cut, which caused a 528-char stuck
+        # message for CJK-heavy replies.
+        for budget in (
+            SLACK_MSG_MAX_BYTES * 3 // 4,
+            SLACK_MSG_MAX_BYTES // 2,
+            SLACK_MSG_MAX_BYTES // 4,
+        ):
+            short = _fit_with_suffix(
+                text, budget, "\n\n_… (response truncated)_"
+            )
+            try:
+                await self._app.client.chat_update(
+                    channel=channel, ts=ts, text=short
+                )
+                return
+            except SlackApiError as retry_err:
+                if retry_err.response["error"] != "msg_too_long":
+                    logger.warning(
+                        "Failed to update Slack message %s: %s",
+                        ts,
+                        retry_err.response["error"],
+                    )
+                    return
+        logger.warning(
+            "Slack rejected update to %s at all fallback sizes", ts
+        )
 
     async def _upload_snippet(
         self, channel: str, thread_ts: str, content: str
-    ) -> None:
+    ) -> bool:
         try:
             await self._app.client.files_upload_v2(
                 channel=channel,
@@ -525,8 +796,10 @@ class SlackAdapter:
                 filename="response.md",
                 title="Full Response",
             )
+            return True
         except SlackApiError as e:
             logger.warning("Failed to upload snippet: %s", e.response["error"])
+            return False
 
     async def start(self) -> None:
         self._handler = AsyncSocketModeHandler(
@@ -534,6 +807,35 @@ class SlackAdapter:
         )
         logger.info("Starting Slack adapter (Socket Mode)")
         await self._handler.connect_async()
+
+        try:
+            auth = await self._app.client.auth_test()
+            self._bot_user_id = auth.get("user_id")
+            logger.info(
+                "Resolved bot identity: %s (%s)",
+                auth.get("user"),
+                self._bot_user_id,
+            )
+        except SlackApiError as e:
+            logger.warning(
+                "Failed to resolve bot identity: %s", e.response["error"]
+            )
+
+        if self._config.startup_notify_channel and self._config.startup_notify_message:
+            try:
+                await self._app.client.chat_postMessage(
+                    channel=self._config.startup_notify_channel,
+                    text=self._config.startup_notify_message,
+                )
+                logger.info(
+                    "Startup notification sent to %s",
+                    self._config.startup_notify_channel,
+                )
+            except SlackApiError as e:
+                logger.warning(
+                    "Failed to send startup notification: %s",
+                    e.response["error"],
+                )
 
     async def stop(self) -> None:
         if self._handler:

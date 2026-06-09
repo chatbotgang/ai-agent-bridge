@@ -29,13 +29,14 @@ class ClaudeController:
         is_new: bool,
         work_dir: Path | None = None,
         context: dict[str, str] | None = None,
+        system_prompt: str | None = None,
     ) -> AsyncIterator[BridgeEvent]:
         """Run a Claude Code prompt and yield streaming BridgeEvents."""
         cwd = work_dir or self._config.work_dir
         timeout = self._config.timeout_seconds
 
-        cmd = self._build_command(session_id, prompt, is_new, context)
-        logger.info("Running claude: %s (cwd=%s, timeout=%ss)", cmd[:5], cwd, timeout)
+        cmd = self._build_command(session_id, prompt, is_new, system_prompt)
+        logger.info("Running claude: %s (cwd=%s, timeout=%ss)", cmd, cwd, timeout)
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
@@ -50,8 +51,11 @@ class ClaudeController:
         stderr_task = asyncio.create_task(self._drain_stderr(process))
 
         timed_out = False
+        result_seen = False
         try:
             async for event in self._read_stream_with_timeout(process, timeout):
+                if isinstance(event, Completion):
+                    result_seen = True
                 yield event
         except asyncio.TimeoutError:
             timed_out = True
@@ -61,21 +65,27 @@ class ClaudeController:
                 is_error=True,
             )
         finally:
-            if process.returncode is None:
-                self._kill_process_tree(process, graceful=True)
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=5.0)
-                except asyncio.TimeoutError:
-                    self._kill_process_tree(process, graceful=False)
-                    await process.wait()
-            else:
-                # Main process exited but children may still be running
-                self._kill_process_tree(process, graceful=True)
+            # Kill the whole process group up front. An orphaned grandchild
+            # (e.g. a nested `claude -p` backgrounded by a skill) inherits the
+            # stdout/stderr pipes and keeps them open, which would wedge both
+            # process.wait() and the stderr drain on the still-open pipes.
+            self._kill_process_tree(process, graceful=True)
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                self._kill_process_tree(process, graceful=False)
+                await process.wait()
 
-            stderr_text = await stderr_task
+            try:
+                stderr_text = await asyncio.wait_for(stderr_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                stderr_task.cancel()
+                stderr_text = ""
             return_code = process.returncode
 
-            if not timed_out and return_code and return_code != 0:
+            # Once a result was streamed, the task succeeded — a non-zero exit
+            # code is just our own group teardown (signal), not a failure.
+            if not timed_out and not result_seen and return_code and return_code != 0:
                 if stderr_text:
                     logger.error("Claude stderr: %s", stderr_text[:500])
                 yield Completion(
@@ -88,25 +98,22 @@ class ClaudeController:
         session_id: str,
         prompt: str,
         is_new: bool,
-        context: dict[str, str] | None = None,
+        system_prompt: str | None = None,
     ) -> list[str]:
-        # Prefix prompt with sender identity so Claude knows who is speaking
-        if context:
-            user_name = context.get("user_name", "unknown")
-            user_id = context.get("user_id", "")
-            tag = f"{user_name} ({user_id})" if user_id else user_name
-            tagged_prompt = f"[{tag}]: {prompt}"
-        else:
-            tagged_prompt = prompt
-
         cmd = [
             "claude",
             "-p",
-            tagged_prompt,
+            prompt,
             "--output-format",
             "stream-json",
             "--verbose",
         ]
+
+        if self._config.worktree_enabled:
+            # Use session_id as worktree name so path/branch are deterministic.
+            # On new sessions Claude creates <work_dir>/.claude/worktrees/<session_id>;
+            # on --resume it reuses the existing one and cd's into it automatically.
+            cmd.extend(["-w", session_id])
 
         if is_new:
             cmd.extend(["--session-id", session_id])
@@ -119,26 +126,9 @@ class ClaudeController:
         else:
             cmd.extend(["--permission-mode", permission_mode])
 
-        if context:
-            parts = [
-                f"Platform: {context.get('platform', 'unknown')}",
-            ]
-            if context.get("workspace"):
-                parts.append(f"Workspace: {context['workspace']}")
-            channel_name = context.get("channel_name", "")
-            channel_id = context.get("channel_id", "")
-            if channel_name and channel_id:
-                parts.append(f"Channel: #{channel_name} ({channel_id})")
-            elif channel_id:
-                parts.append(f"Channel: {channel_id}")
-            if context.get("thread_ts"):
-                parts.append(f"Thread: {context['thread_ts']}")
+        cmd.extend(["--effort", self._config.effort])
 
-            system_prompt = (
-                "This conversation is from a chat platform. "
-                "Each message is prefixed with [user_name (user_id)] to identify the speaker.\n"
-                + "\n".join(parts)
-            )
+        if system_prompt:
             cmd.extend(["--append-system-prompt", system_prompt])
 
         return cmd
@@ -171,6 +161,11 @@ class ClaudeController:
                     yield bridge_event
                 else:
                     logger.debug("Filtered out (internal): %s", type(claude_event).__name__)
+                if isinstance(claude_event, ResultEvent):
+                    # `result` is the terminal line; stop reading instead of
+                    # blocking on EOF, which may never arrive if a backgrounded
+                    # grandchild still holds the inherited stdout pipe open.
+                    return
 
     @staticmethod
     def _kill_process_tree(
@@ -206,3 +201,63 @@ class ClaudeController:
         assert process.stderr is not None
         stderr_bytes = await process.stderr.read()
         return stderr_bytes.decode(errors="replace").strip()
+
+    async def cleanup_session(self, session_id: str) -> None:
+        """Remove the worktree and branch that -w created for this session.
+
+        No-op when worktree mode is disabled. Never raises. Sessions are
+        ephemeral and any uncommitted state in the worktree is disposable, so
+        on a clean-remove failure we retry with --force to prevent unbounded
+        accumulation of dirty worktrees on disk.
+        """
+        if not self._config.worktree_enabled:
+            return
+        repo_root = self._config.work_dir
+        worktree_path = repo_root / ".claude" / "worktrees" / session_id
+        branch_name = f"worktree-{session_id}"
+
+        if worktree_path.exists():
+            rc, err = await self._run_git(
+                repo_root, "worktree", "remove", str(worktree_path)
+            )
+            if rc != 0:
+                # Common cause: untracked or modified files in the worktree.
+                logger.info(
+                    "Worktree remove for session %s failed (%s); retrying with --force",
+                    session_id,
+                    err,
+                )
+                rc, err = await self._run_git(
+                    repo_root, "worktree", "remove", "--force", str(worktree_path)
+                )
+                if rc != 0:
+                    logger.warning(
+                        "Worktree force-remove failed for session %s (leaving on disk): %s",
+                        session_id,
+                        err,
+                    )
+                    return
+        else:
+            # Worktree dir gone but admin entry may still linger
+            await self._run_git(repo_root, "worktree", "prune")
+
+        # Branch deletion is best-effort; it may already be gone
+        await self._run_git(repo_root, "branch", "-D", branch_name)
+        logger.info("Cleaned up worktree for session %s", session_id)
+
+    @staticmethod
+    async def _run_git(cwd: Path, *args: str) -> tuple[int, str]:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return -1, "timeout"
+        return proc.returncode or 0, stderr.decode(errors="replace").strip()

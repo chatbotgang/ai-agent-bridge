@@ -10,10 +10,14 @@ Each user message triggers a **one-shot subprocess**:
 
 ```
 claude -p "<prompt>" --output-format stream-json --verbose \
+  [-w <session_id>] \
   [--session-id ID | --resume ID] \
   [--permission-mode MODE] \
+  --effort LEVEL \
   [--append-system-prompt "<context>"]
 ```
+
+`-w <session_id>` is included only when [Worktree Mode](#worktree-mode) is enabled.
 
 The process runs, streams events via stdout, and exits. Session continuity is handled by Claude Code's built-in `--session-id` (new) and `--resume` (continue) flags.
 
@@ -31,6 +35,8 @@ The process runs, streams events via stdout, and exits. Session continuity is ha
 | `AGENT_BRIDGE_CLAUDE_WORK_DIR` | `.` | Working directory where Claude Code operates. This determines which codebase the agent has access to. Path is resolved to absolute at startup. |
 | `AGENT_BRIDGE_CLAUDE_PERMISSION_MODE` | `acceptEdits` | Controls what Claude can do without asking. |
 | `AGENT_BRIDGE_CLAUDE_TIMEOUT_SECONDS` | `600` | Maximum time (seconds) for a single invocation. Process is terminated on timeout. |
+| `AGENT_BRIDGE_CLAUDE_WORKTREE_ENABLED` | `false` | Run each session in its own git worktree (see [Worktree Mode](#worktree-mode)). |
+| `AGENT_BRIDGE_CLAUDE_EFFORT` | `xhigh` | Effort level passed to `claude --effort`. One of `low`, `medium`, `high`, `xhigh`, `max`. |
 
 ### Permission Modes
 
@@ -46,19 +52,63 @@ The process runs, streams events via stdout, and exits. Session continuity is ha
 
 Validation happens at startup — invalid modes raise `ValueError`.
 
+### Worktree Mode
+
+When `AGENT_BRIDGE_CLAUDE_WORKTREE_ENABLED=true`, every session runs in an isolated git worktree, so concurrent sessions never clobber each other's files.
+
+**Layout**
+
+```
+<work_dir>/
+├── .claude/
+│   └── worktrees/
+│       ├── <session_id_1>/      # checked-out branch: worktree-<session_id_1>
+│       └── <session_id_2>/      # checked-out branch: worktree-<session_id_2>
+└── ...
+```
+
+The path and branch names are deterministic: the controller passes `-w <session_id>` on every invocation. Claude Code creates the worktree on the first call and reuses it on `--resume`, automatically running commands with the worktree as cwd.
+
+**Prerequisites (enforced at startup)**
+
+- `work_dir` must be a git repository
+- An `origin` remote must exist with a resolvable `origin/HEAD` — Claude uses it as the base branch. Run `git remote set-head origin --auto` if `symbolic-ref refs/remotes/origin/HEAD` is missing.
+
+Startup fails with a clear error if these are not met.
+
+**Lifecycle**
+
+| Event | What happens |
+|-------|--------------|
+| First message in session | `claude -p -w <session_id> --session-id <session_id> ...` creates the worktree off `origin/HEAD` with branch `worktree-<session_id>`. |
+| Follow-up messages | `claude -p -w <session_id> --resume <session_id> ...` — Claude auto-detects the existing worktree and runs in it. |
+| Session expires (TTL) | Periodic cleanup calls `git worktree remove` then `git branch -D worktree-<session_id>`. |
+| Worktree has uncommitted changes on expiry | Removal is skipped, path is logged. Inspect and clean up manually. |
+| Manual `rm -rf` on the worktree dir | Controller calls `git worktree prune` before the next session so a fresh worktree can be recreated from the existing branch. |
+
+**Limitations**
+
+- Base branch is always `origin/HEAD`. Override by adding a [`WorktreeCreate` hook](https://docs.anthropic.com/en/docs/claude-code/hooks) in the repo.
+- Gitignored dependencies (e.g., `node_modules`, `.venv`) are *not* shared between worktrees — Claude will install into each worktree separately.
+- External state (databases, bound ports, credentials) stays shared — worktrees only isolate the filesystem.
+
 ## Command Building
 
 The controller builds the CLI command in `_build_command()`:
 
-### Prompt tagging
+### Prompt and system prompt: platform-driven
 
-User prompts are prefixed with sender identity:
+The controller is **platform-agnostic**: it never inspects `context` to construct prompts or system text. Whatever the platform supplies through `bridge.handle_message(text=..., system_prompt=...)` is forwarded as-is to `claude -p` and `--append-system-prompt` respectively.
 
-```
-[user_name (user_id)]: original message text
-```
+This means each platform owns its own framing:
 
-This lets Claude Code know who is speaking when multiple users interact in the same session.
+| Platform | What it puts in `text` | What it puts in `system_prompt` |
+|----------|------------------------|----------------------------------|
+| Slack    | `[user_name (user_id)]: original message` | "This conversation is from a chat platform…" + workspace/channel/thread metadata |
+| Heartbeat | The configured prompt verbatim, no prefix | "This is a scheduled invocation, no user listening…" + `fired_at` |
+| (new platform) | Whatever convention fits its sender semantics | Whatever directives fit its invocation model |
+
+Adding a new platform means writing those two strings inside the new adapter — the Claude controller stays untouched.
 
 ### Session handling
 
@@ -66,18 +116,6 @@ This lets Claude Code know who is speaking when multiple users interact in the s
 |----------|------|--------|
 | New session | `--session-id {uuid}` | Creates a fresh Claude Code session |
 | Existing session | `--resume {uuid}` | Continues from where the last message left off |
-
-### System prompt
-
-When context is available (platform, workspace, channel info), it's appended as a system prompt:
-
-```
-This conversation is from a chat platform. Each message is prefixed with [user_name (user_id)] to identify the speaker.
-Platform: slack
-Workspace: MyCompany
-Channel: #engineering (C12345)
-Thread: 1234567890.123456
-```
 
 ## Event Flow
 
@@ -93,9 +131,24 @@ The Claude CLI outputs one JSON object per line. The event parser (`events.py`) 
 | `assistant` (tool_use) | `StatusUpdate` | `"Using {tool_name}..."` |
 | `assistant` (tool_use: AskUserQuestion) | `UserQuestion` | Special case — carries questions + options |
 | `user` (tool_result) | *filtered* | Tool execution results — internal only |
-| `result` | `Completion` | Final result with cost, duration, error status |
+| `result` | `Completion` | Final result with cost, duration, error status, and token usage |
 
 Key design: **agent-internal events never reach the platform**. Thinking, tool results, and init events are filtered out within this module.
+
+### Usage extraction
+
+The `result` line carries a `usage` object plus `num_turns` / `duration_api_ms`. The parser maps these to the bridge's canonical keys and attaches them to `Completion.metadata["usage"]` — the agent reports raw values; the [Bridge assembles the typed `Usage`](../bridge.md#usage-reporting) and accumulates the session total. `cost_usd` and `duration_ms` stay as first-class `Completion` fields.
+
+| Claude `result` field | Canonical key in `metadata["usage"]` |
+|-----------------------|--------------------------------------|
+| `usage.input_tokens` | `input_tokens` |
+| `usage.output_tokens` | `output_tokens` |
+| `usage.cache_read_input_tokens` | `cache_read_tokens` |
+| `usage.cache_creation_input_tokens` | `cache_creation_tokens` |
+| `num_turns` | `num_turns` |
+| `duration_api_ms` | `duration_api_ms` |
+
+Claude's `result` reports usage for **this invocation only** — the cross-turn session total is computed by the Bridge, not Claude.
 
 ### AskUserQuestion
 
@@ -127,15 +180,25 @@ A single Claude `assistant` message can contain multiple content blocks (e.g., t
 
 ```
 1. asyncio.create_subprocess_exec() — spawn claude process in its own process group
-2. Read stdout line-by-line (with overall timeout)
+2. Read stdout line-by-line (with overall timeout), stopping at the terminal `result` line
 3. Background task drains stderr (prevents pipe buffer deadlock)
-4. On completion: collect return code + stderr
+4. On completion: SIGTERM entire process group up front, then collect return code + stderr
 5. On timeout/cleanup: SIGTERM entire process group → wait 5s → SIGKILL entire group
 ```
+
+### Stream termination: break on `result`, not EOF
+
+`claude -p --output-format stream-json` emits exactly one terminal `{"type":"result", …}` line and then exits. The read loop **breaks on that `result` line** rather than waiting for stdout EOF.
+
+This matters when a task leaves a **backgrounded grandchild** alive — e.g. a nested `claude -p` or an `until …` poll loop spawned by a skill. The grandchild inherits the bridge↔claude stdout pipe and keeps its write-end open after the main `claude` process has produced its answer and exited. EOF on the pipe only arrives once **all** write-ends close, so a loop that waited for EOF (and `process.wait()`, which also blocks on the open pipes) would hang until the overall timeout fired — pinning a global concurrency slot for the full timeout window and surfacing a spurious "timed out" error for a task that actually succeeded.
+
+Breaking on `result` loses nothing (it is always the last meaningful line) and frees the slot immediately.
 
 ### Process group cleanup
 
 The subprocess is spawned with `start_new_session=True`, which places it in a dedicated process group. On cleanup, `os.killpg()` sends the signal to the **entire group** — the main `claude` process and all its children (language servers, subprocesses, etc.). This prevents orphan child processes from surviving after the bridge terminates a session.
+
+Because an orphaned grandchild can otherwise wedge both `process.wait()` and the stderr drain on the still-open pipes, the group is killed **up front** in the `finally` block (SIGTERM → wait 5s → SIGKILL) before awaiting the process or stderr. The stderr drain is itself bounded by a short timeout as a backstop.
 
 ### Buffer size
 
@@ -152,8 +215,10 @@ The stdout line buffer is set to **10 MB** (default is 64 KB). Claude Code can p
 
 | Scenario | Result |
 |----------|--------|
-| Process timeout | Error `Completion` with timeout message, process killed |
-| Non-zero exit code | Error `Completion` with exit code, stderr logged |
+| Process timeout (no output) | Error `Completion` with timeout message, process killed |
+| Non-zero exit code *before* a `result` was seen | Error `Completion` with exit code, stderr logged |
+| Non-zero exit code *after* a `result` was seen | Suppressed — the task succeeded; the signal exit is just our own group teardown |
+| `result` with `is_error=true` | Single error `Completion` (the post-result exit code is suppressed, so no duplicate) |
 | Invalid JSON line | Warning logged, line skipped |
 | Pipe buffer overflow | Prevented by 10 MB buffer setting |
 

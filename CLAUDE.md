@@ -37,7 +37,7 @@ Events are defined in `src/agent_bridge/events.py`. Agent-internal events (think
 
 ### Protocols
 
-- `AgentController` — `run(session_id, prompt, is_new, context) → AsyncIterator[BridgeEvent]`
+- `AgentController` — `run(session_id, prompt, is_new, context, system_prompt) → AsyncIterator[BridgeEvent]`. The platform adapter builds `prompt` (already pre-tagged with sender identity if needed) and `system_prompt` (platform-flavored directives); the agent forwards them as-is. The agent must not interpret platform-specific keys out of `context`.
 - `PlatformAdapter` — `start()`, `stop()`
 
 Defined in `src/agent_bridge/protocols.py`. New agents/platforms implement these.
@@ -54,12 +54,14 @@ Defined in `src/agent_bridge/protocols.py`. New agents/platforms implement these
 ```
 1. User message arrives at Platform Adapter
 2. Adapter constructs session_key, acquires per-session lock
-3. Bridge.handle_message(session_key, text, context)
-   → SessionManager resolves key → (session_id, is_new)
+3. Adapter builds `text` (pre-tagged with sender identity) and `system_prompt` (platform directives) — the agent stays platform-agnostic
+4. Bridge.handle_message(session_key, text, context, system_prompt, resumable)
+   → If `resumable=True`: SessionManager resolves key → (session_id, is_new), persisted on disk
+   → If `resumable=False`: bridge mints a fresh ephemeral UUID, SessionManager untouched
    → Semaphore check (reject if capacity full)
-   → AgentController.run(session_id, prompt, is_new, context)
-4. Agent yields BridgeEvents
-5. Adapter renders events as platform-native messages
+   → AgentController.run(session_id, prompt, is_new, context, system_prompt)
+5. Agent yields BridgeEvents
+6. Adapter renders events as platform-native messages
 ```
 
 ## Tech stack
@@ -136,15 +138,27 @@ src/agent_bridge/
 - Async tests run automatically (`asyncio_mode = "auto"`)
 - Test naming: `test_{feature}_{scenario}`
 
+### Commits
+
+- Follow [Conventional Commits](https://www.conventionalcommits.org/) with **lowercase** types: `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, `ci:`, `perf:`, `style:`, `build:`, `revert:`. (Not `Feat:`/`Fix:`.)
+- Optional scope in parens, imperative subject, no trailing period: `fix(slack): release dedupe slot on error`.
+- The type drives the automated release: `feat:` → MINOR, `fix:`/`perf:` → PATCH, `feat!:` or a `BREAKING CHANGE:` footer → breaking (MINOR while in 0.x). Other types cut no release.
+- The `commitlint` PR check rejects non-conforming commits. Since PRs merge with merge commits, **each commit on a branch** (not just the PR title) must conform.
+- Optional local guard: `uv run pre-commit install` wires a `commit-msg` hook that runs the same commitlint config before each commit (see `docs/releasing.md`).
+- Releases are automated from these messages — never hand-edit `[project].version`. See `## Releasing` and `docs/releasing.md`.
+
 ### Adding a new platform adapter
 
 1. Create `platforms/{name}/config.py` — config with `from_env()` + `_validate()`
 2. Create `platforms/{name}/adapter.py` — implements `PlatformAdapter` protocol
 3. Define session key format (e.g. `discord:{guild}:{channel}`)
 4. Own per-session locking strategy
-5. Consume `BridgeEvent`s from `bridge.handle_message()`
-6. Wire up in `__init__.py`
-7. Add documentation in `docs/platforms/{name}.md`
+5. Build the text the agent receives — pre-tag the prompt with sender identity if your platform has one (e.g. `[name]: text`); pass `None` if it doesn't (proactive triggers)
+6. Build the `system_prompt` — platform-flavored directives (chat framing, scheduled-invocation framing, webhook-trigger framing, etc.). The agent forwards it as-is
+7. Decide `resumable`: pass `True` (default) if the same `session_key` should be able to resume the same session later (e.g. chat threads); pass `False` for one-shot triggers where every call must be a fresh, untracked session (e.g. heartbeat ticks)
+8. Consume `BridgeEvent`s from `bridge.handle_message(session_key, text, context, system_prompt, resumable)`
+9. Wire up in `__init__.py`
+10. Add documentation in `docs/platforms/{name}.md`
 
 ### Adding a new agent
 
@@ -152,8 +166,9 @@ src/agent_bridge/
 2. Create `agents/{name}/controller.py` — implements `AgentController` protocol
 3. Create `agents/{name}/events.py` — parse agent output → `BridgeEvent`s
 4. `run()` yields only generic `BridgeEvent`s — agent-internal events stay internal
-5. Wire up in `__init__.py`
-6. Add documentation in `docs/agents/{name}.md`
+5. Treat `system_prompt` and `prompt` as opaque strings built by the platform — do not parse `context` for platform-specific keys
+6. Wire up in `__init__.py`
+7. Add documentation in `docs/agents/{name}.md`
 
 ### Documentation maintenance
 
@@ -176,18 +191,40 @@ uv run agent-bridge
 uv run pytest tests/ -v
 ```
 
+## Releasing
+
+Versioning is automated — **do not hand-edit `[project].version`**. On push to `main`,
+python-semantic-release reads the [Conventional Commits](https://www.conventionalcommits.org/)
+since the last tag (see `### Commits` for the format), bumps the version, tags `vX.Y.Z`,
+writes `CHANGELOG.md`, and publishes to PyPI via OIDC. While in 0.x, breaking changes
+bump the minor (not 1.0.0). Full process + one-time setup: `docs/releasing.md`.
+
 ## Environment variables
 
 All config loads from `.env` via python-dotenv. See `.env.example` for the full list.
 
 | Variable | Required | Default | Component |
 |----------|----------|---------|-----------|
+| `ANTHROPIC_API_KEY` | No | — | Claude CLI (only if not already authenticated via `claude login`) |
 | `AGENT_BRIDGE_SLACK_BOT_TOKEN` | Yes (if using Slack) | — | Slack |
 | `AGENT_BRIDGE_SLACK_APP_TOKEN` | Yes (if using Slack) | — | Slack |
+| `AGENT_BRIDGE_SLACK_ALLOW_CHANNELS` | No | — (allow all) | Slack (comma-separated channel-name allow-list; non-empty also blocks DMs) |
+| `AGENT_BRIDGE_SLACK_CHANNEL_NOT_ALLOWED_MESSAGE` | No | (fixed English notice) | Slack (reply sent to non-allowed channels) |
+| `AGENT_BRIDGE_SLACK_USAGE_REPORT_ENABLED` | No | `false` | Slack (append usage/cost footer to the final reply) |
+| `AGENT_BRIDGE_SLACK_USAGE_REPORT_TEMPLATE` | No | — (built-in default) | Slack (`{placeholder}` template for the usage footer) |
 | `AGENT_BRIDGE_CLAUDE_WORK_DIR` | No | `.` | Claude |
 | `AGENT_BRIDGE_CLAUDE_PERMISSION_MODE` | No | `acceptEdits` | Claude |
 | `AGENT_BRIDGE_CLAUDE_TIMEOUT_SECONDS` | No | `600` | Claude |
+| `AGENT_BRIDGE_CLAUDE_WORKTREE_ENABLED` | No | `false` | Claude |
+| `AGENT_BRIDGE_CLAUDE_EFFORT` | No | `xhigh` | Claude (one of `low`, `medium`, `high`, `xhigh`, `max`) |
 | `AGENT_BRIDGE_SESSION_STORE_PATH` | No | `./sessions.json` | Bridge |
 | `AGENT_BRIDGE_SESSION_TTL_HOURS` | No | `72` | Bridge |
 | `AGENT_BRIDGE_MAX_CONCURRENT_SESSIONS` | No | `5` | Bridge |
+| `AGENT_BRIDGE_DEDUPE_TTL_SECONDS` | No | `0` | Bridge (cross-session prompt dedupe; 0 disables) |
+| `AGENT_BRIDGE_DEDUPE_MAX_ENTRIES` | No | `512` | Bridge (dedupe LRU cap) |
+| `AGENT_BRIDGE_DEDUPE_SIMHASH_THRESHOLD` | No | `0` | Bridge (Hamming threshold for fuzzy match; 0 = exact canonical only) |
+| `AGENT_BRIDGE_HEARTBEAT_ENABLED` | No | `false` | Heartbeat |
+| `AGENT_BRIDGE_HEARTBEAT_INTERVAL_MINUTES` | Yes (if heartbeat enabled) | — | Heartbeat |
+| `AGENT_BRIDGE_HEARTBEAT_PROMPT` | Yes (if heartbeat enabled) | — | Heartbeat |
+| `AGENT_BRIDGE_HEARTBEAT_STATE_PATH` | No | `./heartbeat.json` | Heartbeat |
 | `AGENT_BRIDGE_LOG_LEVEL` | No | `INFO` | Global |
