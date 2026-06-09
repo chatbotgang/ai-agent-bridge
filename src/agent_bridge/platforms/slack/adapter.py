@@ -268,6 +268,38 @@ class SlackAdapter:
                 return
             await self._process_message(event, say, client)
 
+        @self._app.action(re.compile(r".*"))
+        async def handle_block_action(ack, body, say, client) -> None:
+            # Acknowledge immediately to prevent Slack's 3-second timeout error.
+            await ack()
+            # Route the button's value back into the session so the agent can
+            # continue the conversation (e.g. respond to an AskUserQuestion).
+            container = body.get("container", {})
+            channel = container.get("channel_id", "")
+            thread_ts = container.get("thread_ts") or container.get("message_ts", "")
+            user_id = body.get("user", {}).get("id", "")
+            if not channel or not thread_ts or not user_id:
+                return
+            actions = body.get("actions", [])
+            if not actions:
+                return
+            action = actions[0]
+            text = (
+                action.get("value")
+                or action.get("text", {}).get("text", "")
+                or action.get("selected_option", {}).get("text", {}).get("text", "")
+            )
+            if not text:
+                return
+            event = {
+                "channel": channel,
+                "user": user_id,
+                "text": text,
+                "thread_ts": thread_ts,
+                "ts": thread_ts,
+            }
+            await self._process_message(event, say, client)
+
     async def _channel_allowed(self, channel: str, client) -> bool:
         """Gate by the configured channel allow-list.
 
