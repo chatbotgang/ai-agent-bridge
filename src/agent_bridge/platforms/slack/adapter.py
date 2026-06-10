@@ -166,6 +166,15 @@ class SlackAdapter:
                 return
             await self._process_message(event, say, client)
 
+        @self._app.action(re.compile(".*"))
+        async def handle_any_action(ack, body) -> None:
+            # Acknowledge all block_actions events so Slack doesn't show "App not responding".
+            # Interactive buttons in agent-generated messages (e.g. link buttons with action_id)
+            # fire block_actions, but the bridge takes no server-side action on clicks.
+            await ack()
+            action_id = (body.get("actions") or [{}])[0].get("action_id", "unknown")
+            logger.debug("Acknowledged unhandled block action: %s", action_id)
+
     async def _resolve_context(
         self, channel: str, user_id: str, thread_ts: str, client
     ) -> dict[str, str]:
