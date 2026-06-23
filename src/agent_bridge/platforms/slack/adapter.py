@@ -153,12 +153,32 @@ class _SessionState:
 
 
 class SlackInfoCache:
-    """Cache for Slack workspace, channel, and user display names."""
+    """Cache for Slack workspace, channel, user display names, and user emails."""
 
     def __init__(self) -> None:
         self.workspace: str | None = None
         self.channels: dict[str, str] = {}
         self.users: dict[str, str] = {}
+        # Maps user_id → lower-cased email domain, or None when unavailable.
+        self._email_domains: dict[str, str | None] = {}
+
+    async def resolve_email_domain(self, user_id: str, client) -> str | None:
+        """Return the lower-cased email domain for *user_id*, or None on failure.
+
+        Results are cached; a None entry means the lookup was attempted and
+        failed (e.g. the user has no email or the API call errored), so we
+        don't retry on every message.
+        """
+        if user_id not in self._email_domains:
+            try:
+                user_info = await client.users_info(user=user_id)
+                email: str = user_info["user"]["profile"].get("email", "")
+                domain = email.split("@", 1)[1].lower() if "@" in email else None
+            except (SlackApiError, KeyError, IndexError) as e:
+                logger.warning("Failed to resolve email for %s: %s", user_id, e)
+                domain = None
+            self._email_domains[user_id] = domain
+        return self._email_domains[user_id]
 
     async def resolve_channel(self, channel: str, client) -> str:
         """Return the channel name, fetching only on cache miss.
@@ -330,13 +350,43 @@ class SlackAdapter:
             + "\n".join(parts)
         )
 
+    async def _email_domain_allowed(self, user_id: str, client) -> bool:
+        """Return True when the user's email domain is in the allow-list.
+
+        Always returns True when:
+        - the allow-list is empty (feature disabled), or
+        - user_id is empty (bot / webhook trigger with no human sender).
+
+        Fails closed: returns False when the email cannot be resolved.
+        """
+        if not self._config.allow_email_domains:
+            return True
+        if not user_id:
+            return True
+        domain = await self._name_cache.resolve_email_domain(user_id, client)
+        if domain is None:
+            logger.warning(
+                "Could not resolve email for user %s — blocking (fail-closed)", user_id
+            )
+            return False
+        allowed = domain in self._config.allow_email_domains
+        if not allowed:
+            logger.info(
+                "Dropping message from user %s (domain %r not in allow-list)", user_id, domain
+            )
+        return allowed
+
     async def _process_message(self, event: dict, say, client) -> None:
         channel = event.get("channel", "")
         user_id = event.get("user", "")
         text = event.get("text", "")
         thread_ts = event.get("thread_ts") or event.get("ts", "")
 
-        # Gate 0: channel allow-list. Reply with a fixed notice, then stop.
+        # Gate 0: email domain allow-list. Silently drop disallowed senders.
+        if not await self._email_domain_allowed(user_id, client):
+            return
+
+        # Gate 1: channel allow-list. Reply with a fixed notice, then stop.
         if not await self._channel_allowed(channel, client):
             logger.info("Rejecting message from non-allowed channel %s", channel)
             await say(

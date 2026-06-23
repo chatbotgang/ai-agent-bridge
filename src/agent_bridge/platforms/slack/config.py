@@ -26,6 +26,10 @@ class SlackConfig:
     # others (including DMs, which have no name) get channel_not_allowed_message.
     allow_channels: frozenset[str] = frozenset()
     channel_not_allowed_message: str = DEFAULT_CHANNEL_NOT_ALLOWED_MESSAGE
+    # Allow-list of email domains (e.g. {"cresclab.com"}). Empty = allow all.
+    # When non-empty, messages from users whose email domain is NOT in this set
+    # are silently dropped. Bots and messages without a user field are exempt.
+    allow_email_domains: frozenset[str] = frozenset()
     # When True, append a usage/cost footer to the final agent reply. The
     # template (if set) is rendered with {placeholder} substitution; otherwise
     # a built-in default layout is used.
@@ -49,6 +53,12 @@ class SlackConfig:
             for name in raw_channels.split(",")
             if name.strip()
         )
+        raw_domains = os.environ.get("AGENT_BRIDGE_SLACK_ALLOW_EMAIL_DOMAINS", "")
+        allow_email_domains = frozenset(
+            d.strip().lower()
+            for d in raw_domains.split(",")
+            if d.strip()
+        )
         return cls(
             bot_token=bot_token,
             app_token=app_token,
@@ -67,6 +77,7 @@ class SlackConfig:
                 "AGENT_BRIDGE_SLACK_USAGE_REPORT_TEMPLATE"
             )
             or None,
+            allow_email_domains=allow_email_domains,
         )
 
 
