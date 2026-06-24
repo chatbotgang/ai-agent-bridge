@@ -166,6 +166,11 @@ class SlackAdapter:
                 return
             await self._process_message(event, say, client)
 
+        @self._app.action(re.compile(r".*"))
+        async def handle_block_action(ack) -> None:
+            # Ack all block_actions (e.g. URL buttons) to avoid 404 warnings
+            await ack()
+
     async def _resolve_context(
         self, channel: str, user_id: str, thread_ts: str, client
     ) -> dict[str, str]:
