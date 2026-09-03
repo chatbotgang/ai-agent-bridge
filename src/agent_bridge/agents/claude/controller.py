@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import signal
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -227,9 +228,30 @@ class ClaudeController:
             # Worktree dir gone but admin entry may still linger
             await self._run_git(repo_root, "worktree", "prune")
 
+        self._remove_transcript_dir(worktree_path)
+
         # Branch deletion is best-effort; it may already be gone
         await self._run_git(repo_root, "branch", "-D", branch_name)
         logger.info("Cleaned up worktree for session %s", session_id)
+
+    @staticmethod
+    def _remove_transcript_dir(worktree_path: Path) -> None:
+        """Remove Claude's own session transcript dir for this worktree.
+
+        Claude CLI stores each session under
+        ~/.claude/projects/<cwd with every '/' and '.' replaced by '-'>. Since
+        -w sessions use worktree_path as cwd and it's never reused after
+        removal, that directory is otherwise orphaned forever once the
+        worktree itself is gone.
+        """
+        slug = str(worktree_path).replace(".", "-").replace("/", "-")
+        transcript_dir = Path.home() / ".claude" / "projects" / slug
+        try:
+            shutil.rmtree(transcript_dir)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning("Failed to remove transcript dir %s: %s", transcript_dir, e)
 
     @staticmethod
     async def _run_git(cwd: Path, *args: str) -> tuple[int, str]:

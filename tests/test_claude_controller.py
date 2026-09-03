@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -245,6 +246,65 @@ async def test_cleanup_session_removes_clean_worktree(tmp_path: Path):
     worktree_path = _init_repo_with_worktree(tmp_path, session_id)
 
     controller = ClaudeController(_config(tmp_path, worktree_enabled=True))
+    await controller.cleanup_session(session_id)
+
+    assert not worktree_path.exists()
+
+
+def _transcript_dir_for(home: Path, worktree_path: Path) -> Path:
+    slug = str(worktree_path).replace(".", "-").replace("/", "-")
+    return home / ".claude" / "projects" / slug
+
+
+async def test_cleanup_session_removes_transcript_dir(tmp_path: Path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session_id = "clean-session"
+    worktree_path = _init_repo_with_worktree(repo, session_id)
+    transcript_dir = _transcript_dir_for(home, worktree_path)
+    transcript_dir.mkdir(parents=True)
+    (transcript_dir / "session.jsonl").write_text("{}")
+
+    controller = ClaudeController(_config(repo, worktree_enabled=True))
+    await controller.cleanup_session(session_id)
+
+    assert not transcript_dir.exists()
+
+
+async def test_cleanup_session_prune_branch_also_removes_transcript_dir(
+    tmp_path: Path, monkeypatch
+):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: home)
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    session_id = "already-gone-session"
+    worktree_path = _init_repo_with_worktree(repo, session_id)
+    transcript_dir = _transcript_dir_for(home, worktree_path)
+    transcript_dir.mkdir(parents=True)
+
+    # Simulate the worktree dir having already vanished (e.g. manual cleanup)
+    # while the admin entry and transcript dir linger.
+    shutil.rmtree(worktree_path)
+
+    controller = ClaudeController(_config(repo, worktree_enabled=True))
+    await controller.cleanup_session(session_id)
+
+    assert not transcript_dir.exists()
+
+
+async def test_cleanup_session_missing_transcript_dir_does_not_raise(tmp_path: Path):
+    session_id = "no-transcript-session"
+    worktree_path = _init_repo_with_worktree(tmp_path, session_id)
+
+    controller = ClaudeController(_config(tmp_path, worktree_enabled=True))
+    # No transcript dir was ever created for this session; should be a no-op.
     await controller.cleanup_session(session_id)
 
     assert not worktree_path.exists()
