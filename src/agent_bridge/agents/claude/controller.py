@@ -35,7 +35,16 @@ class ClaudeController:
         timeout = self._config.timeout_seconds
 
         cmd = self._build_command(session_id, prompt, is_new, context)
-        logger.info("Running claude: %s (cwd=%s, timeout=%ss)", cmd[:5], cwd, timeout)
+        # Never log the prompt itself: it can carry secrets (e.g. a bearer token
+        # injected for attachment downloads) and ends up in centralized logs.
+        logger.info(
+            "Running claude: session=%s new=%s prompt_chars=%d (cwd=%s, timeout=%ss)",
+            session_id,
+            is_new,
+            len(prompt),
+            cwd,
+            timeout,
+        )
 
         process = await asyncio.create_subprocess_exec(
             *cmd,
