@@ -308,7 +308,7 @@ On a successful (non-error) completion, a usage/cost footer is appended when `AG
 When users upload files in their Slack message, the adapter:
 
 1. Extracts file metadata: name, MIME type, and private download URL
-2. Constructs a curl command hint with the bot token for authentication
+2. Constructs a curl command hint that references `$AGENT_BRIDGE_SLACK_BOT_TOKEN` (never the literal token — prompts are logged and persisted in agent transcripts; the agent subprocess inherits the bridge's environment, so its shell expands the variable)
 3. Appends the hint + file list to the user's prompt text
 
 The agent receives something like:
@@ -316,7 +316,7 @@ The agent receives something like:
 ```
 user's message text
 
-[Slack attachments — download with: curl -H "Authorization: Bearer xoxb-..." "<url>" -o /tmp/<filename>]
+[Slack attachments — download with: curl -H "Authorization: Bearer $AGENT_BRIDGE_SLACK_BOT_TOKEN" "<url>" -o /tmp/<filename>]
 - report.pdf (application/pdf): https://files.slack.com/files-pri/...
 - screenshot.png (image/png): https://files.slack.com/files-pri/...
 ```

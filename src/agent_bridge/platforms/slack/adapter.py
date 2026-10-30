@@ -397,10 +397,12 @@ class SlackAdapter(BasePlatformAdapter[_RenderState]):
             mimetype = f.get("mimetype", "unknown")
             url = f.get("url_private_download") or f.get("url_private") or ""
             parts.append(f"- {name} ({mimetype}): {url}")
-        token = self._config.bot_token
+        # Reference the env var, never the literal token: the prompt is logged
+        # and persisted in agent transcripts. The agent subprocess inherits the
+        # bridge's environment, so the shell expands it at download time.
         hint = (
             "[Slack attachments — download with: "
-            f'curl -H "Authorization: Bearer {token}" '
+            'curl -H "Authorization: Bearer $AGENT_BRIDGE_SLACK_BOT_TOKEN" '
             '"<url>" -o /tmp/<filename>]'
         )
         text = f"{text}\n\n{hint}\n" + "\n".join(parts)
