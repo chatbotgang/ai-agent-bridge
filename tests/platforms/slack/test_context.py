@@ -59,8 +59,10 @@ def test_prepare_text_appends_attachment_hint():
     text = adapter._prepare_text(event["text"], event)
 
     assert text.startswith("summarize")
-    # Download hint carries the bot token for curl.
-    assert "Authorization: Bearer xoxb-x" in text
+    # Download hint points at the env var; the literal token must never leak
+    # into the prompt (it is logged and persisted in transcripts).
+    assert "Authorization: Bearer $AGENT_BRIDGE_SLACK_BOT_TOKEN" in text
+    assert "xoxb-" not in text
     # url_private_download wins; url_private is the fallback; missing → blank.
     lines = [line.rstrip() for line in text.splitlines()]
     assert "- report.pdf (application/pdf): https://dl.example/report.pdf" in lines
